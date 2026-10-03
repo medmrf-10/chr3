@@ -152,11 +152,17 @@ def search_text(science: str, words: list, match_all: bool = False, top: int = 5
     Hadith results:  {cat,cat_label,id,score,bab?,snippet?} -> get_hadith()."""
     repo = SCIENCES[science]
     is_hdth = science == "hadith"
+    is_quran = science == "tafsir"
     # gather every variant's shard, fetch each shard ONCE in parallel
     word_vars = {w: (_variants(_norm(w)) if expand else {_norm(w)}) for w in words}
     need = {nw[:2] for vs in word_vars.values() for nw in vs if len(nw) >= 2}
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
         shards = dict(zip(need, ex.map(lambda s: _fetch(f"idx/{s}.json.gz", repo), need)))
+    matn_shards = {}
+    if is_hdth:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+            matn_shards = dict(zip(need, ex.map(
+                lambda s: _fetch(f"idxm/{s}.json.gz", repo), need)))
     posts, expanded = {}, {}
     for w, cands in word_vars.items():
         hits = {}
@@ -202,11 +208,14 @@ def search_text(science: str, words: list, match_all: bool = False, top: int = 5
                 seen[bp] += 1
         scored = list(seen.items())
     scored.sort(key=lambda x: -x[1])
-    meta = _books_meta(repo) if not is_hdth else {}
+    meta = _books_meta(repo) if not is_hdth and not is_quran else {}
     results = []
     for (b, i), sc in scored[:top]:
         if is_hdth:
             r = {"cat": b, "cat_label": CAT_LABELS.get(b), "id": i, "score": sc}
+            r["matn"] = _matn_count((b, i), word_vars, matn_shards)
+        elif is_quran:
+            r = {"surah": b, "ayah": i, "score": sc}
         else:
             bk = meta.get(b, {})
             r = {"book": b, "part": i, "score": sc,
@@ -217,6 +226,20 @@ def search_text(science: str, words: list, match_all: bool = False, top: int = 5
     if snippet:
         _add_snippets(science, results, posts)
     return out
+
+
+def _matn_count(loc, word_vars, matn_shards):
+    """How many query words appear in this hadith's MATN (via idxm postings)."""
+    n = 0
+    for w, variants in word_vars.items():
+        for nw in variants:
+            if len(nw) < 2:
+                continue
+            v = matn_shards.get(nw[:2], {}).get(nw)
+            if v and not isinstance(v, dict) and loc in map(tuple, v):
+                n += 1
+                break
+    return n
 
 
 def _add_snippets(science, results, posts, width=160):
@@ -230,6 +253,9 @@ def _add_snippets(science, results, posts, width=160):
                 r["n_sharh"] = d.get("n_sharh")
                 texts = [d.get("text", "")] + [s.get("text", "") for s in d.get("sharh", [])]
                 t = _norm(re.sub(r"<[^>]+>", "", " ".join(texts)))
+            elif science == "tafsir":
+                q = _fetch(f"quran/{r['surah']:03d}.json.gz", "tfsr")
+                t = _norm(q["ayahs"][str(r["ayah"])]["n"])
             else:
                 t = _norm(re.sub(r"<[^>]+>", "", get_part(science, r["book"], r["part"])["text"]))
             best = min((t.find(v) for v in variants), key=lambda x: (x < 0, x), default=-1)
@@ -250,21 +276,33 @@ def search_phrase(science: str, phrase: str, top: int = 20,
     ws = [w for w in (_norm(x) for x in phrase.split()) if len(w) >= 2]
     if not ws:
         return {"results": [], "note": "phrase has no searchable words"}
-    cand = search_text(science, ws, match_all=True, top=300, book_ids=book_ids)
+    cand = search_text(science, ws, match_all=True, top=max(top * 4, 40),
+                       book_ids=book_ids)
     np_ = " ".join(ws)
-    meta = _books_meta(repo)
+    meta = _books_meta(repo) if science not in ("hadith", "tafsir") else {}
 
     def probe(r):
         try:
             if science == "hadith":
                 d = get_hadith(r["cat"], r["id"])
-                t = _norm(re.sub(r"<[^>]+>", "", d.get("text", "")))
+                tm = _norm(re.sub(r"<[^>]+>", "", d.get("text", "")))
+                texts = [d.get("text", "")] + [s.get("text", "") for s in d.get("sharh", [])]
+                t = _norm(re.sub(r"<[^>]+>", "", " ".join(texts)))
                 i = t.find(np_)
                 if i < 0:
                     return None
                 return {"cat": r["cat"], "cat_label": CAT_LABELS.get(r["cat"]),
                         "id": r["id"], "offset": i, "bab": d.get("bab"),
+                        "in_matn": tm.find(np_) >= 0,
                         "snippet": t[max(0, i - 50):i + width]}
+            if science == "tafsir":
+                q = _fetch(f"quran/{r['surah']:03d}.json.gz", "tfsr")
+                t = _norm(q["ayahs"][str(r["ayah"])]["n"])
+                i = t.find(np_)
+                if i < 0:
+                    return None
+                return {"surah": r["surah"], "ayah": r["ayah"], "offset": i,
+                        "snippet": q["ayahs"][str(r["ayah"])]["t"]}
             p = get_part(science, r["book"], r["part"])
         except Exception:
             return None
@@ -289,13 +327,26 @@ def search_phrase(science: str, phrase: str, top: int = 20,
 
 def get_tafsir(surah: int, ayah: int, editions: list = None, html: bool = False):
     """Tafsir of one ayah. editions=list of slugs to keep (default: all 41);
-    html=False returns plain text field 'p' only (x omitted)."""
+    html=False returns plain text field 'p' only (x omitted). Ayahs whose
+    tafsir is grouped under another (p empty, g='s:a') auto-resolve to the
+    group's text and report 'merged_into'."""
     d = _fetch(f"ayah/{surah}/{ayah}.json.gz", "tfsr")
     out = {"s": d["s"], "a": d["a"], "tafsir": {}}
     for slug, e in d["tafsir"].items():
         if editions and slug not in editions:
             continue
-        out["tafsir"][slug] = dict(e) if html else {k: e[k] for k in ("g", "f", "t", "p")}
+        e = dict(e)
+        if not e.get("p") and e.get("g") and e["g"] != f"{surah}:{ayah}":
+            try:
+                gs, ga = (int(x) for x in e["g"].split(":")[:2])
+                pe = _fetch(f"ayah/{gs}/{ga}.json.gz", "tfsr")["tafsir"].get(slug)
+                if pe and pe.get("p"):
+                    e.update({"p": pe["p"], "x": pe.get("x", ""),
+                              "merged_into": e["g"]})
+            except Exception:
+                pass
+        out["tafsir"][slug] = e if html else {k: e.get(k) for k in
+                                              ("g", "f", "t", "p", "merged_into") if k in e or k != "merged_into"}
     return out
 
 
