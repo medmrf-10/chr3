@@ -18,6 +18,8 @@ Part fields: i,t(heading),pg(printed page),j(juz),b(flag),text,fn(footnotes dict
 Arabic URLs must be percent-encoded by the caller (urllib.parse.quote) —
 GitHub Pages rejects raw non-ASCII paths with 400.
 """
+import collections
+import concurrent.futures
 import gzip
 import json
 import os
@@ -76,9 +78,12 @@ def list_sciences():
             for s, r in SCIENCES.items()]
 
 
-def describe_service(science: str):
+def describe_service(science: str = None):
     """The service's own machine-readable doc block (_api in index.json):
-    endpoints, field meanings, boundary flags, hints. Read this first."""
+    endpoints, field meanings, boundary flags, hints. Read this first.
+    science=None returns all sciences' blocks."""
+    if science is None:
+        return {s: _fetch("index.json", r).get("_api") for s, r in SCIENCES.items()}
     repo = SCIENCES[science]
     return _fetch("index.json", repo).get("_api")
 
@@ -110,66 +115,157 @@ def get_part(science: str, book_id: int, part: int, offset: int = 0, limit: int 
     return p
 
 
-def search_text(science: str, words: list, match_all: bool = False, top: int = 50):
+_PREFIXES = ("ال", "و", "ف", "ب", "ل", "ك", "س")
+
+
+def _variants(w: str):
+    """Conservative query-side expansion: strip one/two leading clitics
+    (ال/و/ف/ب/ل/ك/س) and re-attach the bare form — does NOT touch the index."""
+    out = {w}
+    for i in (1, 2):
+        if len(w) > i + 3 and w[:i] in _PREFIXES:
+            out.add(w[i:])
+    if not w.startswith("ال") and len(w) > 3:
+        out.add("ال" + w)
+    return out
+
+
+def _books_meta(repo):
+    d = _fetch("index.json", repo)
+    return {b["id"]: b for b in d.get("books", [])}
+
+
+def search_text(science: str, words: list, match_all: bool = False, top: int = 50,
+                book_ids: list = None, expand: bool = True, snippet: bool = False):
     """Locate text inside a science's books WITHOUT reading whole books.
 
-    words: list of surface forms (they are normalized; pass morphological
-      variants to widen: ["صبر","صابر","يصبر"]). match_all=False -> union
-      (any word hits), True -> intersection (all words in the same part).
-    Returns {total, results:[{book,part}...top], per_word:{w:n}} then use
-    get_part(science,book,part) — the part carries b-flag precision."""
+    words: surface forms (normalized; pass variants to widen). expand=True
+      auto-tries clitic-stripped/ال-attached forms of each word — reported in
+      'expanded'. match_all=False -> union, True -> same-part intersection.
+    book_ids=[...] scopes the search to those books. snippet=True fetches top
+      parts and cuts a context window around the first hit (slower).
+    Returns {total, results:[{book,part,title,author,score,snippet?}]} —
+    score = distinct matched words weighted by rarity; then get_part()."""
     repo = SCIENCES[science]
     posts = {}
+    expanded = {}
     for w in words:
-        nw = _norm(w)
-        if len(nw) < 2:
-            continue
-        sh = _fetch(f"idx/{nw[:2]}.json.gz", repo)
-        posts[nw] = sh.get(nw)
-    found = {w: v for w, v in posts.items() if v}
+        cands = _variants(_norm(w)) if expand else {_norm(w)}
+        hits = {}
+        for nw in cands:
+            if len(nw) < 2:
+                continue
+            sh = _fetch(f"idx/{nw[:2]}.json.gz", repo)
+            v = sh.get(nw)
+            if v:
+                hits[nw] = v
+        if hits:
+            posts[w] = hits
+            if len(hits) > 1:
+                expanded[w] = sorted(hits)
+        else:
+            posts[w] = {}
     missing = [w for w, v in posts.items() if not v]
     if match_all and missing:
         return {"total": 0, "results": [], "missing": missing,
                 "note": "word absent from corpus — intersection is empty"}
-    if not found:
+    if not any(posts.values()):
         return {"total": 0, "results": [], "missing": missing,
-                "note": "no postings — try more variants (ال/و/ة/ى spellings)"}
-    counts = {w: (v["~"] if isinstance(v, dict) else len(v)) for w, v in found.items()}
+                "note": "no postings — try more variants"}
+    scope = set(book_ids) if book_ids else None
+
+    def postings_of(hits):
+        for v in hits.values():
+            if isinstance(v, dict):
+                continue
+            for b, i in v:
+                if scope is None or b in scope:
+                    yield (b, i)
+
+    capped = {w for w, h in posts.items() if any(isinstance(v, dict) for v in h.values())}
     if match_all:
-        sets = [set(map(tuple, v)) for w, v in found.items() if not isinstance(v, dict)]
-        if len(sets) < len(found):
-            return {"total": 0, "results": [], "missing": missing,
-                    "per_word": counts,
-                    "note": "one word is capped/common — drop it or add rarer words"}
+        sets = []
+        for w, h in posts.items():
+            if not h:
+                continue
+            s = set()
+            for v in h.values():
+                if not isinstance(v, dict):
+                    s.update((b, i) for b, i in v if scope is None or b in scope)
+            if not s:
+                return {"total": 0, "results": [], "missing": missing,
+                        "note": f"'{w}' has no postings in scope"}
+            sets.append(s)
         hits = set.intersection(*sets) if sets else set()
+        scored = [(h, len(sets)) for h in hits]
     else:
-        hits = set()
-        for v in found.values():
-            if not isinstance(v, dict):
-                hits.update(map(tuple, v))
-    results = [{"book": b, "part": i} for b, i in sorted(hits)][:top]
-    return {"total": len(hits), "results": results, "missing": missing,
-            "per_word": counts}
+        seen = collections.Counter()
+        for w, h in posts.items():
+            for bp in set(postings_of(h)):
+                seen[bp] += 1
+        scored = list(seen.items())
+    scored.sort(key=lambda x: -x[1])
+    meta = _books_meta(repo)
+    results = []
+    for (b, i), sc in scored[:top]:
+        bk = meta.get(b, {})
+        r = {"book": b, "part": i, "score": sc,
+             "title": bk.get("title"), "author": bk.get("author")}
+        results.append(r)
+    out = {"total": len(scored), "results": results, "missing": missing,
+           "expanded": expanded or None, "capped": sorted(capped) or None}
+    if snippet:
+        _add_snippets(science, results, posts)
+    return out
 
 
-def search_phrase(science: str, phrase: str, top: int = 20):
-    """Exact normalized phrase inside a science. Fetches candidate parts and
-    verifies containment — slower but exact. Returns [{book,part,offset}]."""
+def _add_snippets(science, results, posts, width=160):
+    words = [w for w, h in posts.items() if h]
+    for r in results:
+        try:
+            t = _norm(re.sub(r"<[^>]+>", "", get_part(science, r["book"], r["part"])["text"]))
+            best = min((t.find(v) for w in words for h in [posts[w]] for v in h),
+                       key=lambda x: (x < 0, x), default=-1)
+            if best >= 0:
+                r["snippet"] = t[max(0, best - 40):best + width]
+        except Exception:
+            pass
+
+
+def search_phrase(science: str, phrase: str, top: int = 20,
+                  book_ids: list = None, width: int = 160):
+    """Exact normalized phrase inside a science — candidate parts fetched in
+    parallel and verified for containment. Results carry a text snippet around
+    the hit plus book title/author. book_ids=[...] scopes candidates."""
     repo = SCIENCES[science]
     ws = [w for w in (_norm(x) for x in phrase.split()) if len(w) >= 2]
     if not ws:
         return {"results": [], "note": "phrase has no searchable words"}
-    cand = search_text(science, ws, match_all=True, top=200)
+    cand = search_text(science, ws, match_all=True, top=300, book_ids=book_ids)
     np_ = " ".join(ws)
-    out = []
-    for r in cand.get("results", []):
-        p = get_part(science, r["book"], r["part"])
+    meta = _books_meta(repo)
+
+    def probe(r):
+        try:
+            p = get_part(science, r["book"], r["part"])
+        except Exception:
+            return None
         t = _norm(re.sub(r"<[^>]+>", "", p["text"]))
         i = t.find(np_)
-        if i >= 0:
-            out.append({"book": r["book"], "part": r["part"], "offset": i})
-            if len(out) >= top:
-                break
+        if i < 0:
+            return None
+        bk = meta.get(r["book"], {})
+        return {"book": r["book"], "part": r["part"], "offset": i,
+                "title": bk.get("title"), "author": bk.get("author"),
+                "snippet": t[max(0, i - 50):i + width]}
+
+    out = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        for res in ex.map(probe, cand.get("results", [])):
+            if res:
+                out.append(res)
+                if len(out) >= top:
+                    break
     return {"total": len(out), "results": out}
 
 
