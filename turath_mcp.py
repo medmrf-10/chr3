@@ -14,12 +14,16 @@ Service contract (identical across the 9 book sciences):
 Boundary flags: m=source marker (exact) | t=title located in text (exact)
   a=approx (title unfound; text is the claimed page window) | z=zero-length heading.
 Part fields: i,t(heading),pg(printed page),j(juz),b(flag),text,fn(footnotes dict).
+
+Arabic URLs must be percent-encoded by the caller (urllib.parse.quote) —
+GitHub Pages rejects raw non-ASCII paths with 400.
 """
 import gzip
 import json
 import os
 import re
 import sys
+import urllib.parse
 import urllib.request
 
 BASE = "https://medmrf-10.github.io"
@@ -58,7 +62,7 @@ def _fetch(path: str, repo: str):
             with open(p, encoding="utf-8") as f:
                 data = json.load(f)
     else:
-        url = f"{BASE}/{repo}/api/{path}"
+        url = f"{BASE}/{repo}/api/{urllib.parse.quote(path)}"
         with urllib.request.urlopen(url, timeout=60) as r:
             raw = r.read()
         data = json.loads(gzip.decompress(raw) if path.endswith(".json.gz") else raw)
