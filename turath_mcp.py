@@ -135,37 +135,41 @@ def _books_meta(repo):
     return {b["id"]: b for b in d.get("books", [])}
 
 
+CAT_LABELS = {1: "usul", 2: "maalem", 3: "wajiz", 4: "kulliyya"}
+
+
 def search_text(science: str, words: list, match_all: bool = False, top: int = 50,
                 book_ids: list = None, expand: bool = True, snippet: bool = False):
-    """Locate text inside a science's books WITHOUT reading whole books.
+    """Locate text inside a science WITHOUT reading whole books.
 
     words: surface forms (normalized; pass variants to widen). expand=True
-      auto-tries clitic-stripped/ال-attached forms of each word — reported in
-      'expanded'. match_all=False -> union, True -> same-part intersection.
-    book_ids=[...] scopes the search to those books. snippet=True fetches top
-      parts and cuts a context window around the first hit (slower).
-    Returns {total, results:[{book,part,title,author,score,snippet?}]} —
-    score = distinct matched words weighted by rarity; then get_part()."""
+      auto-tries clitic-stripped/ال-attached forms — reported in 'expanded'.
+    match_all=False -> union, True -> same-part intersection.
+    book_ids=[...] scopes (science books; for hadith it scopes to cat ids 1-4).
+    snippet=True fetches top hits and cuts a context window (parallel).
+
+    Science results: {book,part,title,author,score,snippet?} -> get_part().
+    Hadith results:  {cat,cat_label,id,score,bab?,snippet?} -> get_hadith()."""
     repo = SCIENCES[science]
-    posts = {}
-    expanded = {}
-    for w in words:
-        cands = _variants(_norm(w)) if expand else {_norm(w)}
+    is_hdth = science == "hadith"
+    # gather every variant's shard, fetch each shard ONCE in parallel
+    word_vars = {w: (_variants(_norm(w)) if expand else {_norm(w)}) for w in words}
+    need = {nw[:2] for vs in word_vars.values() for nw in vs if len(nw) >= 2}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        shards = dict(zip(need, ex.map(lambda s: _fetch(f"idx/{s}.json.gz", repo), need)))
+    posts, expanded = {}, {}
+    for w, cands in word_vars.items():
         hits = {}
         for nw in cands:
             if len(nw) < 2:
                 continue
-            sh = _fetch(f"idx/{nw[:2]}.json.gz", repo)
-            v = sh.get(nw)
+            v = shards[nw[:2]].get(nw)
             if v:
                 hits[nw] = v
-        if hits:
-            posts[w] = hits
-            if len(hits) > 1:
-                expanded[w] = sorted(hits)
-        else:
-            posts[w] = {}
-    missing = [w for w, v in posts.items() if not v]
+        posts[w] = hits
+        if len(hits) > 1:
+            expanded[w] = sorted(hits)
+    missing = [w for w, h in posts.items() if not h]
     if match_all and missing:
         return {"total": 0, "results": [], "missing": missing,
                 "note": "word absent from corpus — intersection is empty"}
@@ -174,62 +178,67 @@ def search_text(science: str, words: list, match_all: bool = False, top: int = 5
                 "note": "no postings — try more variants"}
     scope = set(book_ids) if book_ids else None
 
-    def postings_of(hits):
-        for v in hits.values():
+    capped = {w for w, h in posts.items() if any(isinstance(v, dict) for v in h.values())}
+
+    def all_posts(h):
+        for v in h.values():
             if isinstance(v, dict):
                 continue
-            for b, i in v:
-                if scope is None or b in scope:
-                    yield (b, i)
+            for bp in v:
+                if scope is None or bp[0] in scope:
+                    yield tuple(bp)
 
-    capped = {w for w, h in posts.items() if any(isinstance(v, dict) for v in h.values())}
     if match_all:
-        sets = []
-        for w, h in posts.items():
-            if not h:
-                continue
-            s = set()
-            for v in h.values():
-                if not isinstance(v, dict):
-                    s.update((b, i) for b, i in v if scope is None or b in scope)
-            if not s:
-                return {"total": 0, "results": [], "missing": missing,
-                        "note": f"'{w}' has no postings in scope"}
-            sets.append(s)
+        sets = [set(all_posts(h)) for w, h in posts.items() if h]
         hits = set.intersection(*sets) if sets else set()
+        if scope and not hits:
+            return {"total": 0, "results": [], "missing": missing,
+                    "note": "no shared postings in scope"}
         scored = [(h, len(sets)) for h in hits]
     else:
         seen = collections.Counter()
-        for w, h in posts.items():
-            for bp in set(postings_of(h)):
+        for h in posts.values():
+            for bp in set(all_posts(h)):
                 seen[bp] += 1
         scored = list(seen.items())
     scored.sort(key=lambda x: -x[1])
-    meta = _books_meta(repo)
+    meta = _books_meta(repo) if not is_hdth else {}
     results = []
     for (b, i), sc in scored[:top]:
-        bk = meta.get(b, {})
-        r = {"book": b, "part": i, "score": sc,
-             "title": bk.get("title"), "author": bk.get("author")}
+        if is_hdth:
+            r = {"cat": b, "cat_label": CAT_LABELS.get(b), "id": i, "score": sc}
+        else:
+            bk = meta.get(b, {})
+            r = {"book": b, "part": i, "score": sc,
+                 "title": bk.get("title"), "author": bk.get("author")}
         results.append(r)
     out = {"total": len(scored), "results": results, "missing": missing,
-           "expanded": expanded or None, "capped": sorted(capped) or None}
+           "expanded": expanded, "capped": sorted(capped)}
     if snippet:
         _add_snippets(science, results, posts)
     return out
 
 
 def _add_snippets(science, results, posts, width=160):
-    words = [w for w, h in posts.items() if h]
-    for r in results:
+    variants = [v for h in posts.values() for v in h]
+
+    def snip(r):
         try:
-            t = _norm(re.sub(r"<[^>]+>", "", get_part(science, r["book"], r["part"])["text"]))
-            best = min((t.find(v) for w in words for h in [posts[w]] for v in h),
-                       key=lambda x: (x < 0, x), default=-1)
+            if science == "hadith":
+                d = get_hadith(r["cat"], r["id"])
+                r["bab"] = d.get("bab")
+                r["n_sharh"] = d.get("n_sharh")
+                texts = [d.get("text", "")] + [s.get("text", "") for s in d.get("sharh", [])]
+                t = _norm(re.sub(r"<[^>]+>", "", " ".join(texts)))
+            else:
+                t = _norm(re.sub(r"<[^>]+>", "", get_part(science, r["book"], r["part"])["text"]))
+            best = min((t.find(v) for v in variants), key=lambda x: (x < 0, x), default=-1)
             if best >= 0:
                 r["snippet"] = t[max(0, best - 40):best + width]
         except Exception:
             pass
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        list(ex.map(snip, results))
 
 
 def search_phrase(science: str, phrase: str, top: int = 20,
@@ -247,6 +256,15 @@ def search_phrase(science: str, phrase: str, top: int = 20,
 
     def probe(r):
         try:
+            if science == "hadith":
+                d = get_hadith(r["cat"], r["id"])
+                t = _norm(re.sub(r"<[^>]+>", "", d.get("text", "")))
+                i = t.find(np_)
+                if i < 0:
+                    return None
+                return {"cat": r["cat"], "cat_label": CAT_LABELS.get(r["cat"]),
+                        "id": r["id"], "offset": i, "bab": d.get("bab"),
+                        "snippet": t[max(0, i - 50):i + width]}
             p = get_part(science, r["book"], r["part"])
         except Exception:
             return None
