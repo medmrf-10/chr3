@@ -44,11 +44,11 @@ _WORD = re.compile(r"[ء-غف-ي]+")
 
 def _norm(s: str) -> str:
     """Match the index normalization exactly: no diacritics/tatweel,
-    أإآٱ→ا, ى→ي, ة→ه. Prefixes (ال/و/ف..) are NOT stripped —
-    pass your own variants to search_text."""
+    أإآٱ→ا, ى→ي, ئ→ي, ؤ→و, ة→ه. Prefixes (ال/و/ف..) are NOT
+    stripped — pass your own variants to search_text."""
     s = _HARAKAT.sub("", s)
     s = re.sub(r"[أإآٱ]", "ا", s)
-    return s.replace("ى", "ي").replace("ة", "ه")
+    return s.replace("ى", "ي").replace("ئ", "ي").replace("ؤ", "و").replace("ة", "ه")
 
 
 def _fetch(path: str, repo: str):
@@ -57,17 +57,29 @@ def _fetch(path: str, repo: str):
         return _CACHE[key]
     if LOCAL:
         p = os.path.join(LOCAL, repo, "api", path)
-        if p.endswith(".json.gz"):
-            with gzip.open(p, "rt", encoding="utf-8") as f:
-                data = json.load(f)
-        else:
-            with open(p, encoding="utf-8") as f:
-                data = json.load(f)
+        try:
+            if p.endswith(".json.gz"):
+                with gzip.open(p, "rt", encoding="utf-8") as f:
+                    data = json.load(f)
+            else:
+                with open(p, encoding="utf-8") as f:
+                    data = json.load(f)
+        except FileNotFoundError:
+            if path.startswith(("idx/", "idxm/")):
+                data = {}
+            else:
+                raise
     else:
         url = f"{BASE}/{repo}/api/{urllib.parse.quote(path)}"
-        with urllib.request.urlopen(url, timeout=60) as r:
-            raw = r.read()
-        data = json.loads(gzip.decompress(raw) if path.endswith(".json.gz") else raw)
+        try:
+            with urllib.request.urlopen(url, timeout=60) as r:
+                raw = r.read()
+            data = json.loads(gzip.decompress(raw) if path.endswith(".json.gz") else raw)
+        except urllib.error.HTTPError as e:
+            if e.code == 404 and path.startswith(("idx/", "idxm/")):
+                data = {}  # shard absent -> word absent from corpus
+            else:
+                raise
     _CACHE[key] = data
     return data
 
