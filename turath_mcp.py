@@ -342,6 +342,7 @@ def get_tafsir(surah: int, ayah: int, editions: list = None, html: bool = False)
                 pe = _fetch(f"ayah/{gs}/{ga}.json.gz", "tfsr")["tafsir"].get(slug)
                 if pe and pe.get("p"):
                     e.update({"p": pe["p"], "x": pe.get("x", ""),
+                              "f": pe.get("f"), "t": pe.get("t"),
                               "merged_into": e["g"]})
             except Exception:
                 pass
