@@ -149,6 +149,23 @@ def _books_meta(repo):
 
 CAT_LABELS = {1: "usul", 2: "maalem", 3: "wajiz", 4: "kulliyya"}
 
+SURAH_NAMES = ["", "الفاتحة", "البقرة", "آل عمران", "النساء", "المائدة", "الأنعام",
+    "الأعراف", "الأنفال", "التوبة", "يونس", "هود", "يوسف", "الرعد", "إبراهيم",
+    "الحجر", "النحل", "الإسراء", "الكهف", "مريم", "طه", "الأنبياء", "الحج",
+    "المؤمنون", "النور", "الفرقان", "الشعراء", "النمل", "القصص", "العنكبوت",
+    "الروم", "لقمان", "السجدة", "الأحزاب", "سبأ", "فاطر", "يس", "الصافات",
+    "ص", "الزمر", "غافر", "فصلت", "الشورى", "الزخرف", "الدخان", "الجاثية",
+    "الأحقاف", "محمد", "الفتح", "الحجرات", "ق", "الذاريات", "الطور", "النجم",
+    "القمر", "الرحمن", "الواقعة", "الحديد", "المجادلة", "الحشر", "الممتحنة",
+    "الصف", "الجمعة", "المنافقون", "التغابن", "الطلاق", "التحريم", "الملك",
+    "القلم", "الحاقة", "المعارج", "نوح", "الجن", "المزمل", "المدثر",
+    "القيامة", "الإنسان", "المرسلات", "النبأ", "النازعات", "عبس", "التكوير",
+    "الانفطار", "المطففين", "الانشقاق", "البروج", "الطارق", "الأعلى", "الغاشية",
+    "الفجر", "البلد", "الشمس", "الليل", "الضحى", "الشرح", "التين", "العلق",
+    "القدر", "البينة", "الزلزلة", "العاديات", "القارعة", "التكاثر", "العصر",
+    "الهمزة", "الفيل", "قريش", "الماعون", "الكوثر", "الكافرون", "النصر",
+    "المسد", "الإخلاص", "الفلق", "الناس"]
+
 
 def search_text(science: str, words: list, match_all: bool = False, top: int = 50,
                 book_ids: list = None, expand: bool = True, snippet: bool = False):
@@ -227,7 +244,8 @@ def search_text(science: str, words: list, match_all: bool = False, top: int = 5
             r = {"cat": b, "cat_label": CAT_LABELS.get(b), "id": i, "score": sc}
             r["matn"] = _matn_count((b, i), word_vars, matn_shards)
         elif is_quran:
-            r = {"surah": b, "ayah": i, "score": sc}
+            r = {"surah": b, "surah_name": SURAH_NAMES[b] if b < len(SURAH_NAMES) else None,
+                 "ayah": i, "score": sc}
         else:
             bk = meta.get(b, {})
             r = {"book": b, "part": i, "score": sc,
@@ -313,7 +331,8 @@ def search_phrase(science: str, phrase: str, top: int = 20,
                 i = t.find(np_)
                 if i < 0:
                     return None
-                return {"surah": r["surah"], "ayah": r["ayah"], "offset": i,
+                return {"surah": r["surah"], "surah_name": SURAH_NAMES[r["surah"]],
+                        "ayah": r["ayah"], "offset": i,
                         "snippet": q["ayahs"][str(r["ayah"])]["t"]}
             p = get_part(science, r["book"], r["part"])
         except Exception:
