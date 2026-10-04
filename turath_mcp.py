@@ -404,6 +404,57 @@ def get_hadith(category: int, hadith_id: int):
     return _fetch(f"hadith/{category}/{hadith_id}.json.gz", "hdth")
 
 
+def _all_hadith_records():
+    """Every shami record across the 4 cats -> [(cat_int, rec)]."""
+    out = []
+    for cat, name in enumerate(("usul", "maalem", "wajiz", "kulliyya"), 1):
+        for rec in _fetch(f"hadiths/{name}.json.gz", "hdth").values():
+            out.append((cat, rec))
+    return out
+
+
+def list_source_babs(source: str = None):
+    """Chapter (bab) index of the source books via locs.babs across all cats.
+
+    source=None -> {source_book: n_distinct_babs} (the browsing menu, e.g.
+      'صحيح البخاري': 99+ chapters aggregated from all four collections).
+    source='صحيح البخاري' -> {'source':..., 'babs':{bab_name: n_hadiths}}
+      feed each bab into hadiths_in_bab()."""
+    index = {}
+    for cat, rec in _all_hadith_records():
+        for book, l in (rec.get("locs") or {}).items():
+            for bab in (l.get("babs") or []):
+                index.setdefault(book, {}).setdefault(bab, 0)
+                index[book][bab] += 1
+    if source is None:
+        return {b: len(v) for b, v in
+                sorted(index.items(), key=lambda x: -len(x[1]))}
+    return {"source": source, "babs": index.get(source, {}),
+            "known_sources": sorted(index)}
+
+
+def hadiths_in_bab(source: str, bab: str, top: int = 200):
+    """Hadiths filed under one bab of a source book (inverse of locs).
+    -> [{'cat','cat_label','id','no','hukm','nums','excerpt'}].
+    source/bab names from list_source_babs()."""
+    out = []
+    for cat, rec in _all_hadith_records():
+        l = (rec.get("locs") or {}).get(source)
+        if not l or bab not in (l.get("babs") or []):
+            continue
+        nums = l.get("nums") or []
+        babs = l.get("babs") or []
+        out.append({"cat": cat, "cat_label": CAT_LABELS.get(cat),
+                    "id": rec["id"], "no": rec.get("no"),
+                    "hukm": rec.get("hukm"),
+                    "nums": nums,
+                    "excerpt": re.sub(r"<[^>]+>", "",
+                                      rec.get("text", ""))[:120]})
+        if len(out) >= top:
+            break
+    return {"source": source, "bab": bab, "total": len(out), "results": out}
+
+
 def main():
     try:
         from mcp.server.fastmcp import FastMCP
@@ -413,7 +464,7 @@ def main():
     app = FastMCP("turath")
     for t in (list_sciences, describe_service, list_books, get_toc, get_part,
               search_text, search_phrase, get_tafsir, get_tafsir_surah,
-              list_hadiths, get_hadith):
+              list_hadiths, get_hadith, list_source_babs, hadiths_in_bab):
         app.tool()(t)
     app.run()
 
