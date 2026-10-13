@@ -71,15 +71,24 @@ def _fetch(path: str, repo: str):
                 raise
     else:
         url = f"{BASE}/{repo}/api/{urllib.parse.quote(path)}"
-        try:
-            with urllib.request.urlopen(url, timeout=60) as r:
-                raw = r.read()
-            data = json.loads(gzip.decompress(raw) if path.endswith(".json.gz") else raw)
-        except urllib.error.HTTPError as e:
-            if e.code == 404 and path.startswith(("idx/", "idxm/")):
-                data = {}  # shard absent -> word absent from corpus
-            else:
+        last_err = None
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(url, timeout=15) as r:
+                    raw = r.read()
+                data = json.loads(gzip.decompress(raw) if path.endswith(".json.gz") else raw)
+                last_err = None
+                break
+            except urllib.error.HTTPError as e:
+                if e.code == 404 and path.startswith(("idx/", "idxm/")):
+                    data = {}  # shard absent -> word absent from corpus
+                    last_err = None
+                    break
                 raise
+            except Exception as e:
+                last_err = e
+        if last_err is not None:
+            raise last_err
     _CACHE[key] = data
     return data
 
@@ -106,18 +115,304 @@ def list_books(science: str):
     return _fetch("index.json", repo)
 
 
+def _all_books_catalog():
+    """Unified catalog across all 11 sciences (cached in memory)."""
+    ckey = ("__catalog__", "all")
+    if ckey in _CACHE:
+        return _CACHE[ckey]
+    items = list(SCIENCES.items())
+    with concurrent.futures.ThreadPoolExecutor(max_workers=11) as ex:
+        fetched = dict(zip(
+            [s for s, _ in items],
+            ex.map(lambda sr: _fetch("index.json", sr[1]), items)
+        ))
+    catalog = []
+    for s, d in fetched.items():
+        if s == "tafsir":
+            for ed in d.get("editions", []):
+                title = ed.get("name", "")
+                author = title.split("—")[-1].strip() if "—" in title else ""
+                catalog.append({
+                    "science": "tafsir",
+                    "id": ed.get("id"),
+                    "slug": ed.get("slug"),
+                    "title": title,
+                    "author": author,
+                    "type": "tafsir_edition",
+                    "_nt": _norm(title),
+                    "_na": _norm(author),
+                    "_nb": "",
+                })
+        elif s == "hadith":
+            shami_names = {
+                1: ("usul", "جامع الأصول التسعة"),
+                2: ("maalem", "معالم السنة النبوية"),
+                3: ("wajiz", "الوجيز في السنة النبوية"),
+                4: ("kulliyya", "الأحاديث الكلية"),
+            }
+            shami_meta = d.get("shami", {})
+            for cid, (ckey_s, cname) in shami_names.items():
+                author = "صالح أحمد الشامي"
+                catalog.append({
+                    "science": "hadith",
+                    "id": cid,
+                    "cat_label": ckey_s,
+                    "title": cname,
+                    "author": author,
+                    "n_hadiths": shami_meta.get(ckey_s, {}).get("hadiths"),
+                    "type": "hadith_collection",
+                    "_nt": _norm(cname),
+                    "_na": _norm(author),
+                    "_nb": "",
+                })
+            for sb in d.get("sharh_books", []):
+                title = sb.get("title", "")
+                author = sb.get("author", "")
+                catalog.append({
+                    "science": "hadith",
+                    "id": sb.get("sid"),
+                    "title": title,
+                    "author": author,
+                    "nparts": sb.get("parts"),
+                    "matns": sb.get("matns", []),
+                    "type": "hadith_sharh",
+                    "_nt": _norm(title),
+                    "_na": _norm(author),
+                    "_nb": _norm(" ".join(sb.get("matns", []))),
+                })
+        else:
+            for b in d.get("books", []):
+                title = b.get("title", "")
+                author = b.get("author", "")
+                betaka = b.get("betaka", "")
+                catalog.append({
+                    "science": s,
+                    "id": b.get("id"),
+                    "slug": b.get("slug"),
+                    "title": title,
+                    "author": author,
+                    "death": b.get("death"),
+                    "nparts": b.get("nparts"),
+                    "type": "book",
+                    "_nt": _norm(title),
+                    "_na": _norm(author),
+                    "_nb": _norm(betaka),
+                })
+    _CACHE[ckey] = catalog
+    return catalog
+
+
+def find_book(query: str, science: str = None, top: int = 20):
+    """Find any book by title or author across all 11 sciences WITHOUT knowing
+    its science first (covers 736 science books + 72 hadith sharh books +
+    4 shami collections + 41 tafsir editions = 853 books).
+
+    Returns [{science, id, title, author, death?, nparts?, slug?, type, score}].
+    Use the returned (science, id) directly in get_toc(science, id),
+    get_part(science, id, part), or search_text(science, ..., book_ids=[id])."""
+    nq = _norm(query).strip()
+    if not nq:
+        return {"total": 0, "results": [], "note": "empty query"}
+    q_words = [w for w in nq.split() if w]
+    q_vars = {w: _variants(w) for w in q_words}
+    catalog = _all_books_catalog()
+    full_matches = []
+    partial_matches = []
+    for item in catalog:
+        if science and item["science"] != science:
+            continue
+        nt, na, nb = item["_nt"], item["_na"], item["_nb"]
+        matched_words = 0
+        score = 0
+        if nq == nt:
+            score += 200
+        elif nq in nt:
+            score += 100
+        if nq and nq in na:
+            score += 90
+        for w, vs in q_vars.items():
+            in_t = any(v in nt for v in vs)
+            in_a = any(v in na for v in vs)
+            in_b = any(v in nb for v in vs)
+            if in_t or in_a or in_b:
+                matched_words += 1
+                if in_t:
+                    score += 30
+                if in_a:
+                    score += 25
+                if not in_t and not in_a and in_b:
+                    score += 8
+        if matched_words == len(q_words):
+            full_matches.append((score, -len(nt), item))
+        elif matched_words > 0:
+            partial_matches.append((matched_words * 20 + score, -len(nt), item))
+    chosen = full_matches if full_matches else partial_matches
+    chosen.sort(key=lambda x: (-x[0], -x[1]))
+    results = []
+    for sc, _, it in chosen[:top]:
+        r = {k: v for k, v in it.items() if not k.startswith("_") and v is not None}
+        r["score"] = sc
+        results.append(r)
+    return {"total": len(chosen), "results": results}
+
+
 def get_toc(science: str, book_id: int):
     """A book's own toc: {id,title,author,toc:[{i,t,d,pg,j,sz}]} —
-    i is the part index for get_part; sz is approx size in bytes."""
+    i is the part index for get_part; sz is approx size in bytes.
+    Works for the 9 book sciences AND hadith sharh books (science='hadith')."""
     repo = SCIENCES[science]
+    if science == "hadith":
+        raw_toc = _fetch(f"sharh/{book_id}/toc.json", repo)
+        idx = _fetch("index.json", repo)
+        sb = next((x for x in idx.get("sharh_books", []) if x.get("sid") == book_id), {})
+        norm_toc = [
+            {"i": e.get("part", e.get("i")), "t": e.get("title", e.get("t", "")),
+             "d": e.get("d", 1), "sz": e.get("chars", e.get("sz"))}
+            for e in raw_toc
+        ]
+        return {"id": book_id, "title": sb.get("title"), "author": sb.get("author"), "toc": norm_toc}
     return _fetch(f"books/{book_id}/toc.json", repo)
 
 
-def get_part(science: str, book_id: int, part: int, offset: int = 0, limit: int = 0):
-    """One toc entry's text: {i,t,pg,j,b,text,fn?}. offset/limit (chars) window
-    the text for reading around a hit without taking the whole part."""
+def _toc_with_paths(science: str, book_id: int):
+    """Compute and cache hierarchical breadcrumb paths ('الكتاب > الباب > الفصل')
+    for every entry in a book's TOC."""
+    ckey = ("__toc_paths__", science, book_id)
+    if ckey in _CACHE:
+        return _CACHE[ckey]
+    toc_obj = get_toc(science, book_id)
+    stack = []
+    entries = []
+    by_part = {}
+    for e in toc_obj.get("toc", []):
+        d = e.get("d") if e.get("d") is not None else 0
+        t = (e.get("t") or "").strip()
+        while stack and stack[-1][0] >= d:
+            stack.pop()
+        if t:
+            stack.append((d, t))
+        path = " > ".join(x[1] for x in stack) if stack else t
+        item = dict(e)
+        item["path"] = path
+        item["_nt"] = _norm(t)
+        item["_np"] = _norm(path)
+        entries.append(item)
+        by_part[e.get("i")] = path
+    res = {
+        "id": toc_obj.get("id", book_id),
+        "title": toc_obj.get("title"),
+        "author": toc_obj.get("author"),
+        "entries": entries,
+        "by_part": by_part,
+    }
+    _CACHE[ckey] = res
+    return res
+
+
+def search_toc(query: str, science: str, book_id: int = None,
+               book_ids: list = None, top: int = 30):
+    """Search chapter/section headings (TOC) inside a specific book, a list of
+    books, or an entire science, returning exact part numbers and full
+    hierarchical breadcrumb paths ('الكتاب > الباب > الفصل').
+
+    Matches words across both the heading itself and its parent chapter path
+    (e.g. 'شروط السلم' matches 'فصل في شروطه' under 'كتاب السلم')."""
+    nq = _norm(query).strip()
+    if not nq:
+        return {"total": 0, "results": [], "note": "empty query"}
+    q_words = [w for w in nq.split() if w]
+    q_vars = {w: _variants(w) for w in q_words}
     repo = SCIENCES[science]
-    p = _fetch(f"books/{book_id}/parts/{part:04d}.json.gz", repo)
+    if book_id is not None:
+        target_ids = [book_id]
+    elif book_ids:
+        target_ids = list(book_ids)
+    elif science == "hadith":
+        idx = _fetch("index.json", repo)
+        target_ids = [sb["sid"] for sb in idx.get("sharh_books", [])]
+    else:
+        idx = _fetch("index.json", repo)
+        target_ids = [b["id"] for b in idx.get("books", [])]
+
+    def fetch_one(bid):
+        try:
+            return _toc_with_paths(science, bid)
+        except Exception:
+            return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
+        tocs = [t for t in ex.map(fetch_one, target_ids) if t]
+
+    full_hits = []
+    partial_hits = []
+    for t_obj in tocs:
+        bid = t_obj["id"]
+        btitle = t_obj.get("title")
+        bauthor = t_obj.get("author")
+        for e in t_obj["entries"]:
+            nt, np_ = e["_nt"], e["_np"]
+            d_val = e.get("d") if e.get("d") is not None else 0
+            matched = 0
+            score = 0
+            if nq == nt:
+                score += 200
+            elif nq in nt:
+                score += 120
+            elif nq in np_:
+                score += 70
+            for w, vs in q_vars.items():
+                in_t = any(v in nt for v in vs)
+                in_p = any(v in np_ for v in vs)
+                if in_t or in_p:
+                    matched += 1
+                    score += 35 if in_t else 18
+            if matched == len(q_words):
+                full_hits.append((score, -d_val, -len(nt), bid, btitle, bauthor, e))
+            elif matched > 1 and len(q_words) > 1:
+                partial_hits.append((matched * 15 + score, -d_val, -len(nt), bid, btitle, bauthor, e))
+
+    chosen = full_hits if full_hits else partial_hits
+    chosen.sort(key=lambda x: (-x[0], -x[1], -x[2]))
+    results = []
+    for sc, _, _, bid, btitle, bauthor, e in chosen[:top]:
+        r = {
+            "science": science,
+            "book": bid,
+            "book_title": btitle,
+            "author": bauthor,
+            "part": e.get("i"),
+            "title": e.get("t"),
+            "path": e.get("path"),
+            "d": e.get("d"),
+            "pg": e.get("pg"),
+            "j": e.get("j"),
+            "sz": e.get("sz"),
+            "score": sc,
+        }
+        results.append({k: v for k, v in r.items() if v is not None})
+    return {"total": len(chosen), "results": results}
+
+
+def get_part(science: str, book_id: int, part: int, offset: int = 0, limit: int = 0):
+    """One toc entry's text: {i,t,path,book_title,author,pg,j,b,text,fn?}.
+    offset/limit (chars) window the text for reading around a hit without
+    taking the whole part. Works for the 9 book sciences AND hadith sharh books."""
+    repo = SCIENCES[science]
+    if science == "hadith":
+        raw_p = _fetch(f"sharh/{book_id}/parts/{part:04d}.json.gz", repo)
+        p = {"i": raw_p.get("part", part), "t": raw_p.get("title", ""), "text": raw_p.get("text", "")}
+    else:
+        p = dict(_fetch(f"books/{book_id}/parts/{part:04d}.json.gz", repo))
+    try:
+        tp = _toc_with_paths(science, book_id)
+        if tp.get("title"):
+            p["book_title"] = tp["title"]
+        if tp.get("author"):
+            p["author"] = tp["author"]
+        if part in tp["by_part"]:
+            p["path"] = tp["by_part"][part]
+    except Exception:
+        pass
     if offset or limit:
         full = p["text"]
         p = dict(p)
@@ -404,57 +699,6 @@ def get_hadith(category: int, hadith_id: int):
     return _fetch(f"hadith/{category}/{hadith_id}.json.gz", "hdth")
 
 
-def _all_hadith_records():
-    """Every shami record across the 4 cats -> [(cat_int, rec)]."""
-    out = []
-    for cat, name in enumerate(("usul", "maalem", "wajiz", "kulliyya"), 1):
-        for rec in _fetch(f"hadiths/{name}.json.gz", "hdth").values():
-            out.append((cat, rec))
-    return out
-
-
-def list_source_babs(source: str = None):
-    """Chapter (bab) index of the source books via locs.babs across all cats.
-
-    source=None -> {source_book: n_distinct_babs} (the browsing menu, e.g.
-      'صحيح البخاري': 99+ chapters aggregated from all four collections).
-    source='صحيح البخاري' -> {'source':..., 'babs':{bab_name: n_hadiths}}
-      feed each bab into hadiths_in_bab()."""
-    index = {}
-    for cat, rec in _all_hadith_records():
-        for book, l in (rec.get("locs") or {}).items():
-            for bab in (l.get("babs") or []):
-                index.setdefault(book, {}).setdefault(bab, 0)
-                index[book][bab] += 1
-    if source is None:
-        return {b: len(v) for b, v in
-                sorted(index.items(), key=lambda x: -len(x[1]))}
-    return {"source": source, "babs": index.get(source, {}),
-            "known_sources": sorted(index)}
-
-
-def hadiths_in_bab(source: str, bab: str, top: int = 200):
-    """Hadiths filed under one bab of a source book (inverse of locs).
-    -> [{'cat','cat_label','id','no','hukm','nums','excerpt'}].
-    source/bab names from list_source_babs()."""
-    out = []
-    for cat, rec in _all_hadith_records():
-        l = (rec.get("locs") or {}).get(source)
-        if not l or bab not in (l.get("babs") or []):
-            continue
-        nums = l.get("nums") or []
-        babs = l.get("babs") or []
-        out.append({"cat": cat, "cat_label": CAT_LABELS.get(cat),
-                    "id": rec["id"], "no": rec.get("no"),
-                    "hukm": rec.get("hukm"),
-                    "nums": nums,
-                    "excerpt": re.sub(r"<[^>]+>", "",
-                                      rec.get("text", ""))[:120]})
-        if len(out) >= top:
-            break
-    return {"source": source, "bab": bab, "total": len(out), "results": out}
-
-
 def main():
     try:
         from mcp.server.fastmcp import FastMCP
@@ -462,9 +706,9 @@ def main():
         print("pip install mcp required", file=sys.stderr)
         sys.exit(1)
     app = FastMCP("turath")
-    for t in (list_sciences, describe_service, list_books, get_toc, get_part,
-              search_text, search_phrase, get_tafsir, get_tafsir_surah,
-              list_hadiths, get_hadith, list_source_babs, hadiths_in_bab):
+    for t in (list_sciences, describe_service, list_books, find_book,
+              get_toc, search_toc, get_part, search_text, search_phrase,
+              get_tafsir, get_tafsir_surah, list_hadiths, get_hadith):
         app.tool()(t)
     app.run()
 
